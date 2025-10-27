@@ -94,7 +94,7 @@ jobs:
           path: dist
           destination: dist
 
- smoke_e2e:
+  smoke_e2e:
   # usa la imagen ligera si no corres Selenium
   executor: node_light   # cimg/node:20.11
   environment:
