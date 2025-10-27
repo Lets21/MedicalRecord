@@ -4,6 +4,10 @@ executors:
   node_browsers:
     docker:
       - image: cimg/node:20.11-browsers
+  # Ligero para pasos que no necesitan navegadores (smoke)
+  node_light:
+    docker:
+      - image: cimg/node:20.11
 
 workflows:
   build_and_deploy:
@@ -17,7 +21,7 @@ workflows:
           requires: [lint, test_unit]
       - smoke_e2e:
           requires: [build]
-      # Activa este job solo si vas a desplegar desde CircleCI a Vercel
+      # Activa esto si vas a desplegar desde CircleCI a Vercel
       # - deploy_vercel:
       #     requires: [smoke_e2e]
       #     filters:
@@ -84,6 +88,8 @@ jobs:
       - run:
           name: Build de producción
           command: |
+            # Asegura deps (por si el workspace se queda corto)
+            npm ci
             npm run build
             test -f dist/index.html
       - persist_to_workspace:
@@ -95,70 +101,66 @@ jobs:
           destination: dist
 
   smoke_e2e:
-  # usa la imagen ligera si no corres Selenium
-  executor: node_light   # cimg/node:20.11
-  environment:
-    APP_URL: "http://localhost:4173"
-  steps:
-    - checkout
-    - attach_workspace:
-        at: .
-    - run:
-        name: Vite preview + smoke con limpieza robusta
-        command: |
-          set -euo pipefail
+    executor: node_light
+    environment:
+      APP_URL: "http://localhost:4173"
+    steps:
+      - checkout
+      - attach_workspace:
+          at: .
+      - run:
+          name: Vite preview + smoke con limpieza robusta
+          command: |
+            set -euo pipefail
 
-          # Levanta vite preview y asegura limpieza aunque falle el script
-          npx vite preview --port 4173 --strictPort &> /tmp/preview.log &
-          PID=$!
+            # Levanta vite preview en segundo plano
+            npx vite preview --port 4173 --strictPort &> /tmp/preview.log &
+            PID=$!
 
-          # Mata todo al salir, pase lo que pase
-          cleanup() {
-            # intenta TERM, luego KILL si aún vive
-            if kill -0 "$PID" 2>/dev/null; then
-              kill "$PID" || true
+            # Limpieza garantizada al salir
+            cleanup() {
+              if kill -0 "$PID" 2>/dev/null; then
+                kill "$PID" || true
+                sleep 1
+                kill -9 "$PID" || true
+              fi
+              pkill -f "vite.*preview" || true
+            }
+            trap cleanup EXIT
+
+            # Espera hasta 30s a que responda
+            for i in $(seq 1 30); do
+              if curl -fsS "$APP_URL" > /dev/null; then
+                break
+              fi
               sleep 1
-              kill -9 "$PID" || true
+            done
+
+            # Sanity check del HTML servido
+            curl -fsS "$APP_URL" | grep -qi '<div id="root">' >/dev/null
+            echo "Smoke: página responde"
+          no_output_timeout: 5m
+      - store_artifacts:
+          path: /tmp/preview.log
+          destination: preview.log
+      - run:
+          name: Notificar Telegram (éxito)
+          when: on_success
+          command: |
+            if [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -n "${TELEGRAM_CHAT_ID:-}" ]; then
+              MSG="✅ Smoke OK • ${CIRCLE_PROJECT_REPONAME} • ${CIRCLE_BRANCH} • ${CIRCLE_BUILD_URL}"
+              curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+                -d chat_id="${TELEGRAM_CHAT_ID}" --data-urlencode text="$MSG" >/dev/null || true
             fi
-            # como plan B, mata procesos por nombre (vite preview)
-            pkill -f "vite.*preview" || true
-          }
-          trap cleanup EXIT
-
-          # Espera a que responda (máx 30s)
-          for i in $(seq 1 30); do
-            if curl -fsS "$APP_URL" > /dev/null; then
-              break
+      - run:
+          name: Notificar Telegram (fallo)
+          when: on_fail
+          command: |
+            if [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -n "${TELEGRAM_CHAT_ID:-}" ]; then
+              MSG="❌ Smoke FAIL • ${CIRCLE_PROJECT_REPONAME} • ${CIRCLE_BRANCH} • ${CIRCLE_BUILD_URL}"
+              curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+                -d chat_id="${TELEGRAM_CHAT_ID}" --data-urlencode text="$MSG" >/dev/null || true
             fi
-            sleep 1
-          done
-
-          # Valida que entregue index.html
-          curl -fsS "$APP_URL" | grep -qi "<div id=\"root\"" >/dev/null
-          echo "Smoke: página responde"
-        no_output_timeout: 5m
-    - store_artifacts:
-        path: /tmp/preview.log
-        destination: preview.log
-    - run:
-        name: Notificar Telegram (éxito)
-        when: on_success
-        command: |
-          if [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -n "${TELEGRAM_CHAT_ID:-}" ]; then
-            MSG="✅ Smoke OK • ${CIRCLE_PROJECT_REPONAME} • ${CIRCLE_BRANCH} • ${CIRCLE_BUILD_URL}"
-            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-              -d chat_id="${TELEGRAM_CHAT_ID}" --data-urlencode text="$MSG" >/dev/null || true
-          fi
-    - run:
-        name: Notificar Telegram (fallo)
-        when: on_fail
-        command: |
-          if [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -n "${TELEGRAM_CHAT_ID:-}" ]; then
-            MSG="❌ Smoke FAIL • ${CIRCLE_PROJECT_REPONAME} • ${CIRCLE_BRANCH} • ${CIRCLE_BUILD_URL}"
-            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-              -d chat_id="${TELEGRAM_CHAT_ID}" --data-urlencode text="$MSG" >/dev/null || true
-          fi
-
 
   # Despliegue opcional a Vercel vía CLI
   deploy_vercel:
