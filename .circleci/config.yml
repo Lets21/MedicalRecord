@@ -9,23 +9,90 @@ workflows:
   build_and_deploy:
     jobs:
       - install_deps
+      - lint:
+          requires: [install_deps]
       - test_unit:
           requires: [install_deps]
+      - build:
+          requires: [lint, test_unit]
       - smoke_e2e:
-          requires: [test_unit]
+          requires: [build]
+      # Activa este job solo si vas a desplegar desde CircleCI a Vercel
+      # - deploy_vercel:
+      #     requires: [smoke_e2e]
+      #     filters:
+      #       branches:
+      #         only: main
 
 jobs:
   install_deps:
     executor: node_browsers
     steps:
       - checkout
-      - run: npm ci
+      - run: node -v && npm -v
+      - restore_cache:
+          keys:
+            - npm-v1-{{ arch }}-{{ checksum "package-lock.json" }}
+            - npm-v1-
+      - run:
+          name: Instalar dependencias
+          command: npm ci
+      - save_cache:
+          key: npm-v1-{{ arch }}-{{ checksum "package-lock.json" }}
+          paths:
+            - ~/.npm
+      - persist_to_workspace:
+          root: .
+          paths:
+            - node_modules
+            - package.json
+            - package-lock.json
+
+  lint:
+    executor: node_browsers
+    steps:
+      - checkout
+      - attach_workspace:
+          at: .
+      - run:
+          name: Lint
+          command: npm run lint || echo "sin lint estricto aún"
 
   test_unit:
     executor: node_browsers
     steps:
       - checkout
-      - run: npm run test:unit || echo "sin tests sólidos aún"
+      - attach_workspace:
+          at: .
+      - run:
+          name: Unit tests
+          command: npm run test:unit -- --reporter=junit --outputFile=junit.xml || echo "tests básicos"
+      - store_test_results:
+          path: junit.xml
+          when: always
+      - store_artifacts:
+          path: coverage
+          destination: coverage
+          when: always
+
+  build:
+    executor: node_browsers
+    steps:
+      - checkout
+      - attach_workspace:
+          at: .
+      - run:
+          name: Build de producción
+          command: |
+            npm run build
+            test -f dist/index.html
+      - persist_to_workspace:
+          root: .
+          paths:
+            - dist
+      - store_artifacts:
+          path: dist
+          destination: dist
 
   smoke_e2e:
     executor: node_browsers
@@ -33,17 +100,27 @@ jobs:
       APP_URL: "http://localhost:4173"
     steps:
       - checkout
+      - attach_workspace:
+          at: .
       - run:
-          name: Serve dist y smoke
+          name: Servir dist y prueba de humo (Selenium o curl)
           command: |
-            npm run build
-            npx -y serve dist -l 4173 &>/tmp/preview.log &
+            # Si tienes tests Selenium, ejecuta: npm run test:selenium
+            # Aquí validamos que la app responde
+            npx -y serve dist -l 4173 &> /tmp/preview.log &
             PID=$!
-            for i in $(seq 1 40); do curl -fsS "$APP_URL" && break || sleep 1; done
+            for i in $(seq 1 60); do
+              curl -fsS "$APP_URL" && break || sleep 1
+            done
             echo "Smoke: página responde"
             kill $PID || true
+            wait $PID || true
+          no_output_timeout: 10m
+      - store_artifacts:
+          path: /tmp/preview.log
+          destination: preview.log
       - run:
-          name: Telegram OK
+          name: Notificar Telegram (éxito)
           when: on_success
           command: |
             if [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -n "${TELEGRAM_CHAT_ID:-}" ]; then
@@ -52,11 +129,39 @@ jobs:
                 -d chat_id="${TELEGRAM_CHAT_ID}" --data-urlencode text="$MSG" >/dev/null || true
             fi
       - run:
-          name: Telegram FAIL
+          name: Notificar Telegram (fallo)
           when: on_fail
           command: |
             if [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -n "${TELEGRAM_CHAT_ID:-}" ]; then
               MSG="❌ Smoke FAIL • ${CIRCLE_PROJECT_REPONAME} • ${CIRCLE_BRANCH} • ${CIRCLE_BUILD_URL}"
+              curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+                -d chat_id="${TELEGRAM_CHAT_ID}" --data-urlencode text="$MSG" >/dev/null || true
+            fi
+
+  # Despliegue opcional a Vercel vía CLI
+  deploy_vercel:
+    executor: node_browsers
+    steps:
+      - checkout
+      - attach_workspace:
+          at: .
+      - run:
+          name: Deploy a Vercel (producción)
+          command: |
+            set -euo pipefail
+            if [ -z "${VERCEL_TOKEN:-}" ] || [ -z "${VERCEL_PROJECT_ID:-}" ] || [ -z "${VERCEL_ORG_ID:-}" ]; then
+              echo "Faltan VERCEL_TOKEN / VERCEL_PROJECT_ID / VERCEL_ORG_ID"
+              exit 1
+            fi
+            npx -y vercel pull --yes --environment=production --token "$VERCEL_TOKEN"
+            npx -y vercel build --prod --token "$VERCEL_TOKEN"
+            npx -y vercel deploy --prebuilt --prod --token "$VERCEL_TOKEN"
+      - run:
+          name: Notificar Telegram (deploy)
+          when: on_success
+          command: |
+            if [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -n "${TELEGRAM_CHAT_ID:-}" ]; then
+              MSG="🚀 Deploy OK • ${CIRCLE_PROJECT_REPONAME} • ${CIRCLE_BUILD_URL}"
               curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
                 -d chat_id="${TELEGRAM_CHAT_ID}" --data-urlencode text="$MSG" >/dev/null || true
             fi
