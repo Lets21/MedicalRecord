@@ -11,7 +11,7 @@
     "serve:ci": "vite preview --host 0.0.0.0 --port 4173 --strictPort",
     "test:selenium": "node tests/selenium.smoke.js",
     "test": "vitest",
-    "test:unit": "vitest --run",
+    "test:unit": "vitest --run --coverage",
     "test:watch": "vitest",
     "coverage": "vitest --run --coverage"
   },
