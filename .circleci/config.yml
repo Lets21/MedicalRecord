@@ -4,7 +4,6 @@ executors:
   node_browsers:
     docker:
       - image: cimg/node:20.11-browsers
-  # Ligero para pasos que no necesitan navegadores (smoke)
   node_light:
     docker:
       - image: cimg/node:20.11
@@ -21,12 +20,9 @@ workflows:
           requires: [lint, test_unit]
       - smoke_e2e:
           requires: [build]
-      # Activa esto si vas a desplegar desde CircleCI a Vercel
       # - deploy_vercel:
       #     requires: [smoke_e2e]
-      #     filters:
-      #       branches:
-      #         only: main
+      #     filters: { branches: { only: main } }
 
 jobs:
   install_deps:
@@ -56,8 +52,7 @@ jobs:
     executor: node_browsers
     steps:
       - checkout
-      - attach_workspace:
-          at: .
+      - attach_workspace: { at: . }
       - run:
           name: Lint
           command: npm run lint || echo "sin lint estricto aún"
@@ -66,29 +61,21 @@ jobs:
     executor: node_browsers
     steps:
       - checkout
-      - attach_workspace:
-          at: .
+      - attach_workspace: { at: . }
       - run:
           name: Unit tests
           command: npm run test:unit -- --reporter=junit --outputFile=junit.xml || echo "tests básicos"
-      - store_test_results:
-          path: junit.xml
-          when: always
-      - store_artifacts:
-          path: coverage
-          destination: coverage
-          when: always
+      - store_test_results: { path: junit.xml, when: always }
+      - store_artifacts: { path: coverage, destination: coverage, when: always }
 
   build:
     executor: node_browsers
     steps:
       - checkout
-      - attach_workspace:
-          at: .
+      - attach_workspace: { at: . }
       - run:
           name: Build de producción
           command: |
-            # Asegura deps (por si el workspace se queda corto)
             npm ci
             npm run build
             test -f dist/index.html
@@ -96,9 +83,7 @@ jobs:
           root: .
           paths:
             - dist
-      - store_artifacts:
-          path: dist
-          destination: dist
+      - store_artifacts: { path: dist, destination: dist }
 
   smoke_e2e:
     executor: node_light
@@ -106,43 +91,53 @@ jobs:
       APP_URL: "http://localhost:4173"
     steps:
       - checkout
-      - attach_workspace:
-          at: .
+      - attach_workspace: { at: . }
       - run:
-          name: Vite preview + smoke con limpieza robusta
+          name: Vite preview + smoke con espera y limpieza robustas
           command: |
             set -euo pipefail
 
-            # Levanta vite preview en segundo plano
+            # Arranca vite preview en background y guarda PID
             npx vite preview --port 4173 --strictPort &> /tmp/preview.log &
             PID=$!
 
-            # Limpieza garantizada al salir
+            # Asegura limpieza pase lo que pase
             cleanup() {
               if kill -0 "$PID" 2>/dev/null; then
                 kill "$PID" || true
                 sleep 1
                 kill -9 "$PID" || true
               fi
-              pkill -f "vite.*preview" || true
             }
             trap cleanup EXIT
 
-            # Espera hasta 30s a que responda
+            # Espera tolerante a fallos hasta 30s
+            READY=0
+            set +e
             for i in $(seq 1 30); do
-              if curl -fsS "$APP_URL" > /dev/null; then
+              curl -fsS "$APP_URL" > /dev/null
+              if [ $? -eq 0 ]; then
+                READY=1
                 break
               fi
               sleep 1
             done
+            set -e
 
-            # Sanity check del HTML servido
-            curl -fsS "$APP_URL" | grep -qi '<div id="root">' >/dev/null
-            echo "Smoke: página responde"
+            if [ "$READY" -ne 1 ]; then
+              echo "❌ El servidor de preview no levantó en 30s."
+              echo "---- Últimas líneas de preview.log ----"
+              tail -n 200 /tmp/preview.log || true
+              exit 1
+            fi
+
+            # Validación mínima del HTML servido
+            HTML="$(curl -fsS "$APP_URL")"
+            echo "$HTML" | grep -qi '<div id="root">' >/dev/null
+
+            echo "✅ Smoke: página responde"
           no_output_timeout: 5m
-      - store_artifacts:
-          path: /tmp/preview.log
-          destination: preview.log
+      - store_artifacts: { path: /tmp/preview.log, destination: preview.log }
       - run:
           name: Notificar Telegram (éxito)
           when: on_success
@@ -162,13 +157,11 @@ jobs:
                 -d chat_id="${TELEGRAM_CHAT_ID}" --data-urlencode text="$MSG" >/dev/null || true
             fi
 
-  # Despliegue opcional a Vercel vía CLI
   deploy_vercel:
     executor: node_browsers
     steps:
       - checkout
-      - attach_workspace:
-          at: .
+      - attach_workspace: { at: . }
       - run:
           name: Deploy a Vercel (producción)
           command: |
